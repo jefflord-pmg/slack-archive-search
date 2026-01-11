@@ -1,0 +1,14 @@
+# Ignore everything by default
+*
+
+# But track these files
+!.gitignore
+!*.md
+!*.py
+!requirements.txt
+!display_names.json
+
+# Still ignore Python cache even if .py is tracked
+__pycache__/
+*.pyc
+*.pyo
