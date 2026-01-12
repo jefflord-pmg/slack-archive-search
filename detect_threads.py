@@ -51,11 +51,11 @@ def get_chroma_collection():
     return client.get_collection("slack_messages")
 
 
-def get_llm_client(base_url: str) -> OpenAI:
-    """Get OpenAI client configured for local LLM."""
+def get_llm_client(base_url: str, api_key: Optional[str] = None) -> OpenAI:
+    """Get OpenAI client configured for local or remote LLM."""
     return OpenAI(
         base_url=base_url,
-        api_key="not-needed"
+        api_key=api_key or "not-needed"
     )
 
 
@@ -276,7 +276,8 @@ def extract_features(messages: List[dict]) -> dict:
 
 
 def classify_with_llm(messages: List[dict], features: dict, similarity_hints: str,
-                      llm_url: str, model: str, max_tokens: int = 4000) -> List[dict]:
+                      llm_url: str, model: str, api_key: Optional[str] = None,
+                      max_tokens: int = 4000) -> List[dict]:
     """Use local LLM to identify micro-threads."""
 
     # Format messages for LLM (1-indexed)
@@ -323,7 +324,7 @@ Return ONLY valid JSON (no other text):
     debug_file = BASE_DIR / "llm_debug.json"
 
     try:
-        client = get_llm_client(llm_url)
+        client = get_llm_client(llm_url, api_key)
         response = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
@@ -331,17 +332,40 @@ Return ONLY valid JSON (no other text):
             temperature=0.3
         )
 
-        # Save full response for debugging
+        # Immediately save raw response info before any processing
         debug_data = {
             "timestamp": datetime.now().isoformat(),
             "model": model,
             "response_type": type(response).__name__,
-            "choices_count": len(response.choices) if response.choices else 0,
+            "response_repr": repr(response)[:2000],  # Truncate if huge
         }
+
+        # If response is a string, save it directly
+        if isinstance(response, str):
+            debug_data["raw_string_response"] = response[:5000]
+            with open(debug_file, 'w', encoding='utf-8') as f:
+                json.dump(debug_data, f, indent=2, default=str)
+            print(f"Debug: LLM response saved to {debug_file}")
+            print(f"Warning: Response was a raw string, not an OpenAI response object")
+            # Try to extract JSON from the string response
+            json_match = re.search(r'\{[\s\S]*\}', response)
+            if json_match:
+                try:
+                    result = json.loads(json_match.group())
+                    return result.get('threads', [])
+                except json.JSONDecodeError:
+                    pass
+            return []
+
+        # Add structured response info
+        debug_data["choices_count"] = len(response.choices) if hasattr(response, 'choices') and response.choices else 0
 
         # Extract content - handle different response structures
         content = None
-        message = response.choices[0].message if response.choices else None
+        message = None
+
+        if hasattr(response, 'choices') and response.choices:
+            message = response.choices[0].message if hasattr(response.choices[0], 'message') else None
 
         if message:
             debug_data["message_role"] = getattr(message, 'role', None)
@@ -1097,6 +1121,8 @@ def main():
                         help=f"LLM model name (default: {DEFAULT_MODEL})")
     parser.add_argument("--llm-url", default=DEFAULT_LLM_URL,
                         help=f"LLM server URL (default: {DEFAULT_LLM_URL})")
+    parser.add_argument("--api-key",
+                        help="API key for LLM service (optional, for remote APIs)")
     parser.add_argument("--max-tokens", type=int, default=4000,
                         help="Max tokens for LLM response (default: 4000, increase for thinking models)")
     parser.add_argument("--json", action="store_true",
@@ -1175,7 +1201,7 @@ def main():
     else:
         print(f"Classifying with LLM ({args.model} at {args.llm_url})...")
         threads = classify_with_llm(messages, features, similarity_hints,
-                                     args.llm_url, args.model, args.max_tokens)
+                                     args.llm_url, args.model, args.api_key, args.max_tokens)
 
         # Fallback to embeddings if LLM fails
         if not threads:

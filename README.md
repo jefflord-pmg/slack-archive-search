@@ -45,6 +45,29 @@ c = conn.cursor()
 c.execute("SELECT * FROM messages WHERE text LIKE '%search term%'")
 ```
 
+### Micro-Thread Detection
+
+Detect conversation threads within a time window around a specific message. Outputs a Slack-like HTML interface.
+
+**Local LLM (e.g., LM Studio):**
+```bash
+python detect_threads.py -w 15 -m "qwen/qwen2.5-vl-7b" --max-tokens 10000 --html -o my_threads-local-llm.html --slack-url https://pmgnet.slack.com/archives/C04E1TA8Q/p1768186992287909
+```
+
+**OpenRouter API:**
+```bash
+python detect_threads.py -w 15 --max-tokens 10000 --html -o my_threads-openrouter.html --api-key "sk-or-v1-..." --llm-url "https://openrouter.ai/api/v1" --model "xiaomi/mimo-v2-flash:free" --slack-url https://pmgnet.slack.com/archives/C04E1TA8Q/p1768186992287909
+```
+
+Options:
+- `-w` - Number of messages before/after target (default: 15)
+- `-m` / `--model` - LLM model name
+- `--llm-url` - LLM API endpoint
+- `--api-key` - API key for remote services
+- `--html` - Output as HTML with Slack-like interface
+- `--theme light|dark` - HTML color theme
+- `--no-llm` - Use embeddings-only clustering (no LLM)
+
 ## Files
 
 | File | Purpose |
@@ -53,6 +76,7 @@ c.execute("SELECT * FROM messages WHERE text LIKE '%search term%'")
 | `embed_messages.py` | Create vector embeddings in ChromaDB |
 | `search_slack.py` | Semantic search CLI |
 | `query_slack.py` | SQL-based search CLI |
+| `detect_threads.py` | Micro-thread detection with LLM |
 | `display_names.json` | Map usernames to display names |
 | `CLAUDE.md` | Instructions for Claude Code |
 | `HOW_IT_WORKS.md` | Detailed system documentation |
