@@ -59,6 +59,81 @@ def get_llm_client(base_url: str) -> OpenAI:
     )
 
 
+def load_user_mappings() -> Dict[str, str]:
+    """
+    Load user ID to display name mapping.
+    Combines users.json (ID -> username) and display_names.json (username -> display name).
+    Returns dict of user_id -> display_name (or username if no display name).
+    """
+    user_id_to_name = {}
+
+    # Load users.json (user_id -> username)
+    users_file = BASE_DIR / "users.json"
+    if users_file.exists():
+        with open(users_file, 'r', encoding='utf-8') as f:
+            users = json.load(f)
+    else:
+        users = {}
+
+    # Load display_names.json (username -> display_name)
+    display_names_file = BASE_DIR / "display_names.json"
+    if display_names_file.exists():
+        with open(display_names_file, 'r', encoding='utf-8') as f:
+            display_names = json.load(f)
+    else:
+        display_names = {}
+
+    # Build user_id -> best_name mapping
+    for user_id, username in users.items():
+        display_name = display_names.get(username, '')
+        user_id_to_name[user_id] = display_name if display_name else username
+
+    return user_id_to_name
+
+
+def replace_slack_links(text: str, html_format: bool = False) -> str:
+    """
+    Replace Slack URL links like <https://example.com> or <https://example.com|text> with proper links.
+
+    Args:
+        text: The message text
+        html_format: If True, return HTML anchor tags; otherwise return plain text
+    """
+    def replace_link(match):
+        url = match.group(1)
+        display_text = match.group(2) if match.group(2) else url
+        if html_format:
+            return f'<a href="{url}" target="_blank" rel="noopener">{display_text}</a>'
+        else:
+            return display_text if display_text != url else url
+
+    # Replace <URL> and <URL|display_text> patterns (but not user mentions <@...> or channel refs <#...>)
+    text = re.sub(r'<(https?://[^|>]+)(?:\|([^>]+))?>', replace_link, text)
+    return text
+
+
+def replace_user_mentions(text: str, user_mappings: Dict[str, str], html_format: bool = False) -> str:
+    """
+    Replace Slack user mentions like <@U04EPRRJD> with @displayname.
+
+    Args:
+        text: The message text
+        user_mappings: Dict of user_id -> display_name
+        html_format: If True, wrap mentions in styled span tags
+    """
+    def replace_mention(match):
+        user_id = match.group(1)
+        name = user_mappings.get(user_id, user_id)
+        if html_format:
+            return f'<span class="user-mention">@{name}</span>'
+        else:
+            return f'@{name}'
+
+    # Replace <@USER_ID> and <@USER_ID|display_name> patterns
+    text = re.sub(r'<@([A-Z0-9]+)(?:\|[^>]*)?>', replace_mention, text)
+    return text
+
+
 def fetch_context_window(channel: str, ts: str, window: int = 15) -> Tuple[List[dict], Optional[dict]]:
     """
     Get N messages before and after target timestamp.
@@ -201,7 +276,7 @@ def extract_features(messages: List[dict]) -> dict:
 
 
 def classify_with_llm(messages: List[dict], features: dict, similarity_hints: str,
-                      llm_url: str, model: str) -> List[dict]:
+                      llm_url: str, model: str, max_tokens: int = 4000) -> List[dict]:
     """Use local LLM to identify micro-threads."""
 
     # Format messages for LLM (1-indexed)
@@ -227,7 +302,10 @@ Instructions:
 1. Group messages by conversation topic/thread
 2. Each message can only belong to ONE thread
 3. Consider: who's talking to whom, topic continuity, @mentions, question/answer patterns
-4. Name each thread briefly (2-5 words describing the topic)
+4. Name each thread with a BROAD, GENERAL category (1-2 words max):
+   - Use general topics, not specific details
+   - Examples: "Weather" not "Weather forecast", "Movies" not "Movies/Tron discussion", "Hardware" not "RAM upgrade issue"
+   - Think: what section of a newspaper or forum would this go in?
 5. Assign a confidence score (0.0-1.0) based on how certain you are about the grouping
 
 Return ONLY valid JSON (no other text):
@@ -242,27 +320,115 @@ Return ONLY valid JSON (no other text):
   ]
 }}"""
 
+    debug_file = BASE_DIR / "llm_debug.json"
+
     try:
         client = get_llm_client(llm_url)
         response = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=1500,
+            max_tokens=max_tokens,
             temperature=0.3
         )
 
-        content = response.choices[0].message.content
+        # Save full response for debugging
+        debug_data = {
+            "timestamp": datetime.now().isoformat(),
+            "model": model,
+            "response_type": type(response).__name__,
+            "choices_count": len(response.choices) if response.choices else 0,
+        }
+
+        # Extract content - handle different response structures
+        content = None
+        message = response.choices[0].message if response.choices else None
+
+        if message:
+            debug_data["message_role"] = getattr(message, 'role', None)
+            debug_data["message_keys"] = [k for k in dir(message) if not k.startswith('_')]
+
+            # Standard content field
+            content = getattr(message, 'content', None)
+            debug_data["content"] = content
+
+            # Check for thinking model fields
+            reasoning = getattr(message, 'reasoning_content', None)
+            if reasoning:
+                debug_data["reasoning_content"] = reasoning
+
+            # Check for tool calls or other fields
+            tool_calls = getattr(message, 'tool_calls', None)
+            if tool_calls:
+                debug_data["tool_calls"] = str(tool_calls)
+
+            # Some models put content in different places
+            if not content:
+                # Try to find content in other common locations
+                for attr in ['text', 'output', 'response', 'answer']:
+                    alt_content = getattr(message, attr, None)
+                    if alt_content:
+                        content = alt_content
+                        debug_data[f"alt_content_{attr}"] = alt_content
+                        break
+
+        # Save debug info to file
+        with open(debug_file, 'w', encoding='utf-8') as f:
+            json.dump(debug_data, f, indent=2, default=str)
+        print(f"Debug: LLM response saved to {debug_file}")
+
+        # Handle empty content - try reasoning_content as fallback for thinking models
+        if not content or (isinstance(content, str) and len(content.strip()) == 0):
+            print("Warning: LLM returned empty content field")
+            # Check if reasoning_content has the answer (common with thinking models)
+            if reasoning and isinstance(reasoning, str):
+                print("  Found reasoning_content, checking for JSON in reasoning...")
+                # Sometimes the JSON is at the end of the reasoning
+                json_in_reasoning = re.search(r'\{\s*"threads"\s*:\s*\[[\s\S]*\]\s*\}', reasoning)
+                if json_in_reasoning:
+                    print("  Found JSON in reasoning_content, using that")
+                    content = json_in_reasoning.group()
+                else:
+                    print(f"  No JSON found in reasoning_content ({len(reasoning)} chars)")
+                    print(f"  Check {debug_file} for full response")
+                    return []
+            else:
+                print(f"  Response object had {len(debug_data.get('message_keys', []))} message attributes")
+                return []
+
+        # For thinking models, strip out <think>...</think> or similar tags
+        if isinstance(content, str):
+            # Remove common thinking tags
+            content_cleaned = re.sub(r'<think>[\s\S]*?</think>', '', content, flags=re.IGNORECASE)
+            content_cleaned = re.sub(r'<thinking>[\s\S]*?</thinking>', '', content_cleaned, flags=re.IGNORECASE)
+            content_cleaned = re.sub(r'<reasoning>[\s\S]*?</reasoning>', '', content_cleaned, flags=re.IGNORECASE)
+            if content_cleaned.strip():
+                content = content_cleaned
 
         # Try to extract JSON from response
         json_match = re.search(r'\{[\s\S]*\}', content)
         if json_match:
-            result = json.loads(json_match.group())
-            return result.get('threads', [])
+            try:
+                result = json.loads(json_match.group())
+                threads = result.get('threads', [])
+                if not threads:
+                    print("Warning: LLM response parsed but 'threads' array is empty")
+                    print(f"  Parsed JSON keys: {list(result.keys())}")
+                return threads
+            except json.JSONDecodeError as e:
+                print(f"Warning: Found JSON-like content but failed to parse: {e}")
+                print(f"  Check {debug_file} for full response")
+                return []
+        else:
+            print("Warning: No JSON found in LLM response")
+            print(f"  Check {debug_file} for full response")
+            return []
 
     except json.JSONDecodeError as e:
         print(f"Warning: Could not parse LLM response as JSON: {e}")
     except Exception as e:
         print(f"Warning: LLM classification failed: {e}")
+        import traceback
+        traceback.print_exc()
 
     return []
 
@@ -325,10 +491,13 @@ def classify_with_embeddings_only(messages: List[dict], ids: List[str],
     return threads
 
 
-def format_output(threads: List[dict], messages: List[dict], target_ts: str) -> str:
+def format_output(threads: List[dict], messages: List[dict], target_ts: str, user_mappings: Optional[Dict[str, str]] = None) -> str:
     """Format threads for display, highlighting target message."""
     if not threads:
         return "No threads detected."
+
+    if user_mappings is None:
+        user_mappings = {}
 
     output = []
 
@@ -356,6 +525,8 @@ def format_output(threads: List[dict], messages: List[dict], target_ts: str) -> 
                 time_str = '??:??'
 
             text = msg.get('text', '') or ''
+            text = replace_slack_links(text, html_format=False)
+            text = replace_user_mentions(text, user_mappings, html_format=False)
             text = text[:100] + ('...' if len(text) > 100 else '')
             # Clean up newlines for display
             text = text.replace('\n', ' ')
@@ -399,80 +570,185 @@ def format_json_output(threads: List[dict], messages: List[dict], target_ts: str
     return json.dumps(result, indent=2)
 
 
-def format_html_output(threads: List[dict], messages: List[dict], target_ts: str, channel: str, theme: str = "light") -> str:
+def format_html_output(threads: List[dict], messages: List[dict], target_ts: str, channel: str, theme: str = "light", user_mappings: Optional[Dict[str, str]] = None) -> str:
     """Format threads as HTML with tabbed interface."""
-    import html
+    import html as html_module
 
-    def format_message_html(msg: dict, is_target: bool = False) -> str:
+    if user_mappings is None:
+        user_mappings = {}
+
+    # Color palette for threads (works well in both light and dark themes)
+    thread_colors = [
+        '#3b82f6',  # blue
+        '#10b981',  # green
+        '#f59e0b',  # amber
+        '#ef4444',  # red
+        '#8b5cf6',  # purple
+        '#06b6d4',  # cyan
+        '#f97316',  # orange
+        '#ec4899',  # pink
+        '#14b8a6',  # teal
+        '#6366f1',  # indigo
+    ]
+
+    # Build message index to thread mapping
+    msg_to_thread = {}  # msg_index (1-based) -> thread_index
+    thread_names = {}  # thread_index -> thread_name
+    for thread_idx, thread in enumerate(threads):
+        thread_names[thread_idx] = thread.get('name', f'Thread {thread_idx + 1}')
+        for msg_idx in thread.get('message_indices', []):
+            msg_to_thread[msg_idx] = thread_idx
+
+    def get_thread_color(thread_idx: int) -> str:
+        return thread_colors[thread_idx % len(thread_colors)]
+
+    # Avatar colors for users
+    avatar_colors = [
+        '#e91e63', '#9c27b0', '#673ab7', '#3f51b5', '#2196f3',
+        '#03a9f4', '#00bcd4', '#009688', '#4caf50', '#8bc34a',
+        '#ff9800', '#ff5722', '#795548', '#607d8b',
+    ]
+
+    def get_avatar_color(username: str) -> str:
+        """Get a consistent color for a username."""
+        hash_val = sum(ord(c) for c in (username or 'unknown'))
+        return avatar_colors[hash_val % len(avatar_colors)]
+
+    def get_initials(name: str) -> str:
+        """Get initials from a name (up to 2 chars)."""
+        if not name:
+            return '?'
+        parts = name.split()
+        if len(parts) >= 2:
+            return (parts[0][0] + parts[-1][0]).upper()
+        return name[:2].upper()
+
+    def format_message_html(msg: dict, msg_index: int, is_target: bool = False,
+                            thread_idx: Optional[int] = None, thread_name: Optional[str] = None,
+                            clickable: bool = False) -> str:
         """Format a single message as HTML."""
-        name = html.escape(msg.get('display_name') or msg.get('username') or 'Unknown')
-        text = html.escape(msg.get('text', '') or '')
-        # Convert newlines to <br> and preserve some formatting
+        display_name = msg.get('display_name') or msg.get('username') or 'Unknown'
+        name = html_module.escape(display_name)
+        text = msg.get('text', '') or ''
+
+        # Avatar
+        initials = get_initials(display_name)
+        avatar_color = get_avatar_color(msg.get('username') or display_name)
+
+        # Replace Slack links with HTML anchor tags
+        text = replace_slack_links(text, html_format=True)
+
+        # Replace user mentions with HTML spans
+        text = replace_user_mentions(text, user_mappings, html_format=True)
+
+        # Extract HTML elements and replace with indexed placeholders (before HTML escaping)
+        html_elements = []
+        def extract_html(match):
+            html_elements.append(match.group(0))
+            return f'__HTML_{len(html_elements)-1}__'
+        # Extract anchor tags
+        text = re.sub(r'<a [^>]+>[^<]*</a>', extract_html, text)
+        # Extract user mention spans
+        text = re.sub(r'<span class="user-mention">@[^<]+</span>', extract_html, text)
+
+        # Now HTML escape the text (placeholders are safe)
+        text = html_module.escape(text)
+
+        # Restore the original HTML elements (unescaped)
+        for i, element in enumerate(html_elements):
+            text = text.replace(f'__HTML_{i}__', element)
+
         text = text.replace('\n', '<br>')
 
         try:
             ts = float(msg['ts'])
-            time_str = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
+            time_str = datetime.fromtimestamp(ts).strftime('%I:%M %p')
         except (ValueError, TypeError):
-            time_str = 'Unknown time'
+            time_str = ''
 
         target_class = ' target-message' if is_target else ''
         target_badge = '<span class="target-badge">TARGET</span>' if is_target else ''
 
+        # Thread badge
+        thread_badge = ''
+        click_attr = ''
+        clickable_class = ''
+
+        if thread_idx is not None:
+            color = get_thread_color(thread_idx)
+            badge_label = html_module.escape(thread_name[:20]) if thread_name else f'Thread {thread_idx + 1}'
+            thread_badge = f'<span class="thread-badge" style="background: {color};">{badge_label}</span>'
+            if clickable:
+                escaped_name = html_module.escape(thread_name or f'Thread {thread_idx + 1}').replace("'", "\\'")
+                click_attr = f'onclick="openTab(null, \'thread-{thread_idx}\', \'{escaped_name}\', \'{color}\')"'
+                clickable_class = ' clickable'
+
         return f'''
-        <div class="message{target_class}">
-            <div class="message-header">
-                <span class="message-author">{name}</span>
-                <span class="message-time">{time_str}</span>
-                {target_badge}
+        <div class="message{target_class}{clickable_class}" {click_attr}>
+            <div class="avatar" style="border-color: {avatar_color}; color: {avatar_color};">{initials}</div>
+            <div class="message-body">
+                <div class="message-header">
+                    <span class="message-author">{name}</span>
+                    <span class="message-time">{time_str}</span>
+                    {thread_badge}
+                    {target_badge}
+                </div>
+                <div class="message-text">{text}</div>
             </div>
-            <div class="message-text">{text}</div>
         </div>'''
 
-    # Build thread tabs HTML
+    # Build thread tabs HTML (sidebar items)
     thread_tabs = []
     thread_contents = []
 
     # "All Messages" tab
-    thread_tabs.append('<button class="tab-button active" onclick="openTab(event, \'all-messages\')">All Messages</button>')
+    thread_tabs.append('<button class="thread-item active" data-tab="all-messages" onclick="openTab(event, \'all-messages\', \'All Messages\', \'\')">All Messages</button>')
 
-    all_messages_html = ''.join(
-        format_message_html(msg, msg.get('ts') == target_ts)
-        for msg in messages
-    )
+    # Build all messages with thread coloring
+    all_messages_parts = []
+    for i, msg in enumerate(messages):
+        msg_index = i + 1  # 1-based
+        thread_idx = msg_to_thread.get(msg_index)
+        thread_name = thread_names.get(thread_idx) if thread_idx is not None else None
+        is_target = msg.get('ts') == target_ts
+        all_messages_parts.append(
+            format_message_html(msg, msg_index, is_target, thread_idx, thread_name, clickable=True)
+        )
+    all_messages_html = ''.join(all_messages_parts)
+
     thread_contents.append(f'''
     <div id="all-messages" class="tab-content active">
-        <div class="thread-info">
-            <strong>All {len(messages)} messages</strong> in context window
-        </div>
         {all_messages_html}
     </div>''')
 
-    # Thread tabs
+    # Thread tabs with color indicators
     for i, thread in enumerate(threads):
         tab_id = f'thread-{i}'
-        thread_name = html.escape(thread.get('name', f'Thread {i+1}')[:30])
+        thread_name_raw = thread.get('name', f'Thread {i+1}')
+        thread_name = html_module.escape(thread_name_raw[:30])
         confidence = thread.get('confidence', 0)
+        color = get_thread_color(i)
 
         thread_tabs.append(
-            f'<button class="tab-button" onclick="openTab(event, \'{tab_id}\')">{thread_name}</button>'
+            f'<button class="thread-item" data-tab="{tab_id}" onclick="openTab(event, \'{tab_id}\', \'{thread_name}\', \'{color}\')">'
+            f'<span class="thread-dot" style="background: {color};"></span>'
+            f'<span class="thread-item-text">{thread_name}</span>'
+            f'</button>'
         )
 
-        participants = ', '.join(html.escape(p) for p in thread.get('participants', []))
+        participants = ', '.join(html_module.escape(p) for p in thread.get('participants', []))
         messages_html = ''
 
         for idx in thread.get('message_indices', []):
             if idx < 1 or idx > len(messages):
                 continue
             msg = messages[idx - 1]
-            messages_html += format_message_html(msg, msg.get('ts') == target_ts)
+            messages_html += format_message_html(msg, idx, msg.get('ts') == target_ts, i, thread_names.get(i), clickable=False)
 
         thread_contents.append(f'''
     <div id="{tab_id}" class="tab-content">
         <div class="thread-info">
-            <strong>{html.escape(thread.get('name', 'Unnamed'))}</strong>
-            <span class="confidence">({confidence:.0%} confidence)</span>
-            <br><span class="participants">Participants: {participants}</span>
+            <strong>{len(thread.get('message_indices', []))} messages</strong> &middot; {confidence:.0%} confidence &middot; {participants}
         </div>
         {messages_html}
     </div>''')
@@ -483,128 +759,35 @@ def format_html_output(threads: List[dict], messages: List[dict], target_ts: str
     # Theme-specific CSS
     if theme == "dark":
         theme_css = '''
-        body {
-            background: #1a1a2e;
-            color: #eee;
-        }
-        h1 {
-            color: #fff;
-        }
-        .subtitle {
-            color: #888;
-        }
-        .tab-container {
-            border-bottom: 2px solid #333;
-        }
-        .tab-button {
-            background: #2d2d44;
-            color: #aaa;
-        }
-        .tab-button:hover {
-            background: #3d3d5c;
-            color: #fff;
-        }
-        .tab-button.active {
-            background: #4a4a6a;
-            color: #fff;
-        }
-        .thread-info {
-            background: #2d2d44;
-        }
-        .thread-info strong {
-            color: #7c7cff;
-        }
-        .confidence {
-            color: #888;
-        }
-        .participants {
-            color: #aaa;
-        }
-        .message {
-            background: #252538;
-            border-left: 3px solid #444;
-        }
-        .message:hover {
-            background: #2a2a40;
-        }
-        .message.target-message {
-            border-left: 3px solid #ff6b6b;
-            background: #2d2535;
-        }
-        .message-author {
-            color: #7c7cff;
-        }
-        .message-time {
-            color: #666;
-        }
-        .message-text {
-            color: #ddd;
-        }
-        .message-text a {
-            color: #7c7cff;
+        :root {
+            --bg-primary: #1a1d21;
+            --bg-secondary: #222529;
+            --bg-hover: #2c2f33;
+            --bg-active: #1164a3;
+            --text-primary: #d1d2d3;
+            --text-secondary: #ababad;
+            --text-muted: #616061;
+            --border-color: #393a3d;
+            --author-color: #e8e8e9;
+            --link-color: #1d9bd1;
+            --target-bg: #3a2a2a;
+            --target-border: #e53e3e;
         }'''
-    else:  # light theme
+    else:
         theme_css = '''
-        body {
-            background: #f5f5f5;
-            color: #333;
-        }
-        h1 {
-            color: #222;
-        }
-        .subtitle {
-            color: #666;
-        }
-        .tab-container {
-            border-bottom: 2px solid #ddd;
-        }
-        .tab-button {
-            background: #e0e0e0;
-            color: #555;
-        }
-        .tab-button:hover {
-            background: #d0d0d0;
-            color: #333;
-        }
-        .tab-button.active {
-            background: #4a90d9;
-            color: #fff;
-        }
-        .thread-info {
-            background: #e8e8e8;
-        }
-        .thread-info strong {
-            color: #2563eb;
-        }
-        .confidence {
-            color: #666;
-        }
-        .participants {
-            color: #777;
-        }
-        .message {
-            background: #fff;
-            border-left: 3px solid #ddd;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-        }
-        .message:hover {
-            background: #fafafa;
-        }
-        .message.target-message {
-            border-left: 3px solid #e53e3e;
-            background: #fff5f5;
-        }
-        .message-author {
-            color: #2563eb;
-        }
-        .message-time {
-            color: #999;
-        }
-        .message-text {
-            color: #444;
-        }
-        .message-text a {
-            color: #2563eb;
+        :root {
+            --bg-primary: #fff;
+            --bg-secondary: #f8f8f8;
+            --bg-hover: #f0f0f0;
+            --bg-active: #1164a3;
+            --text-primary: #1d1c1d;
+            --text-secondary: #616061;
+            --text-muted: #868686;
+            --border-color: #e0e0e0;
+            --author-color: #1d1c1d;
+            --link-color: #1264a3;
+            --target-bg: #fff5f5;
+            --target-border: #e53e3e;
         }'''
 
     return f'''<!DOCTYPE html>
@@ -612,141 +795,310 @@ def format_html_output(threads: List[dict], messages: List[dict], target_ts: str
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Micro-Threads: #{html.escape(channel)}</title>
+    <title>#{html_module.escape(channel)}</title>
     <style>
+        {theme_css}
         * {{
             box-sizing: border-box;
+            margin: 0;
+            padding: 0;
         }}
         body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-            margin: 0;
-            padding: 20px;
-            line-height: 1.5;
-        }}
-        h1 {{
-            margin-bottom: 5px;
-        }}
-        .subtitle {{
-            margin-bottom: 20px;
-        }}
-        .tab-container {{
+            font-family: Slack-Lato, Lato, appleLogo, sans-serif;
+            font-size: 15px;
+            line-height: 1.46668;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            height: 100vh;
             display: flex;
-            flex-wrap: wrap;
-            gap: 5px;
-            margin-bottom: 20px;
-            padding-bottom: 10px;
+            flex-direction: column;
         }}
-        .tab-button {{
-            padding: 10px 20px;
-            border: none;
+        .app-container {{
+            display: flex;
+            flex: 1;
+            overflow: hidden;
+        }}
+        /* Sidebar */
+        .sidebar {{
+            width: 240px;
+            background: var(--bg-secondary);
+            border-right: 1px solid var(--border-color);
+            display: flex;
+            flex-direction: column;
+            flex-shrink: 0;
+        }}
+        .sidebar-header {{
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border-color);
+            font-weight: 700;
+            font-size: 15px;
+        }}
+        .sidebar-header small {{
+            font-weight: 400;
+            color: var(--text-muted);
+            font-size: 12px;
+            display: block;
+            margin-top: 2px;
+        }}
+        .thread-list {{
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px 0;
+        }}
+        .thread-item {{
+            padding: 6px 16px;
             cursor: pointer;
-            border-radius: 8px 8px 0 0;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: var(--text-secondary);
             font-size: 14px;
-            transition: all 0.2s;
-            max-width: 200px;
+            border: none;
+            background: none;
+            width: 100%;
+            text-align: left;
+        }}
+        .thread-item:hover {{
+            background: var(--bg-hover);
+        }}
+        .thread-item.active {{
+            background: var(--bg-active);
+            color: #fff;
+        }}
+        .thread-dot {{
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }}
+        .thread-item-text {{
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
         }}
-        .tab-button.active {{
-            font-weight: bold;
+        /* Main content */
+        .main-content {{
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }}
+        .channel-header {{
+            padding: 10px 20px;
+            border-bottom: 1px solid var(--border-color);
+            font-weight: 700;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+        .channel-header .thread-dot {{
+            width: 10px;
+            height: 10px;
+        }}
+        .channel-header small {{
+            font-weight: 400;
+            color: var(--text-muted);
+            font-size: 13px;
+        }}
+        .messages-container {{
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px 0;
         }}
         .tab-content {{
             display: none;
-            animation: fadeIn 0.3s;
         }}
         .tab-content.active {{
             display: block;
         }}
-        @keyframes fadeIn {{
-            from {{ opacity: 0; }}
-            to {{ opacity: 1; }}
-        }}
-        .thread-info {{
-            padding: 15px;
-            border-radius: 8px;
-            margin-bottom: 15px;
-        }}
-        .confidence {{
-            font-size: 14px;
-        }}
-        .participants {{
-            font-size: 13px;
-        }}
+        /* Messages */
         .message {{
-            border-radius: 8px;
-            padding: 15px;
-            margin-bottom: 10px;
+            padding: 4px 20px;
+            display: flex;
+            gap: 8px;
+        }}
+        .message:hover {{
+            background: var(--bg-hover);
+        }}
+        .message.target-message {{
+            background: var(--target-bg);
+            border-left: 3px solid var(--target-border);
+            padding-left: 17px;
+        }}
+        .message.clickable {{
+            cursor: pointer;
+        }}
+        .avatar {{
+            width: 36px;
+            height: 36px;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-size: 13px;
+            background: var(--bg-primary);
+            border: 2px solid;
+            flex-shrink: 0;
+        }}
+        .message-body {{
+            flex: 1;
+            min-width: 0;
         }}
         .message-header {{
             display: flex;
-            align-items: center;
-            gap: 10px;
-            margin-bottom: 8px;
+            align-items: baseline;
+            gap: 8px;
+            flex-wrap: wrap;
         }}
         .message-author {{
-            font-weight: bold;
+            font-weight: 700;
+            color: var(--author-color);
         }}
         .message-time {{
             font-size: 12px;
+            color: var(--text-muted);
+        }}
+        .thread-badge {{
+            font-size: 11px;
+            padding: 1px 6px;
+            border-radius: 3px;
+            color: #fff;
+            font-weight: 600;
         }}
         .target-badge {{
-            background: #e53e3e;
-            color: #fff;
-            padding: 2px 8px;
-            border-radius: 4px;
             font-size: 11px;
-            font-weight: bold;
+            padding: 1px 6px;
+            border-radius: 3px;
+            background: var(--target-border);
+            color: #fff;
+            font-weight: 600;
         }}
         .message-text {{
             word-wrap: break-word;
+            margin-top: 2px;
         }}
-        {theme_css}
+        .message-text a {{
+            color: var(--link-color);
+            text-decoration: none;
+        }}
+        .message-text a:hover {{
+            text-decoration: underline;
+        }}
+        .user-mention {{
+            background: #e8f5fa;
+            color: #1264a3;
+            padding: 0 3px;
+            border-radius: 3px;
+            font-weight: 500;
+        }}
+        .thread-info {{
+            padding: 8px 20px;
+            color: var(--text-muted);
+            font-size: 13px;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+        .thread-info strong {{
+            color: var(--text-primary);
+        }}
     </style>
 </head>
 <body>
-    <h1>Micro-Thread Detection</h1>
-    <p class="subtitle">Channel: #{html.escape(channel)} | {len(threads)} threads detected | {len(messages)} messages analyzed</p>
-
-    <div class="tab-container">
-        {tabs_html}
+    <div class="app-container">
+        <div class="sidebar">
+            <div class="sidebar-header">
+                #{html_module.escape(channel)}
+                <small>{len(messages)} messages &middot; {len(threads)} threads</small>
+            </div>
+            <div class="thread-list">
+                {tabs_html}
+            </div>
+        </div>
+        <div class="main-content">
+            <div class="channel-header" id="content-header">
+                <span>All Messages</span>
+                <small>Click a message to view its thread</small>
+            </div>
+            <div class="messages-container">
+                {contents_html}
+            </div>
+        </div>
     </div>
-
-    {contents_html}
-
     <script>
-        function openTab(evt, tabId) {{
-            // Hide all tab contents
-            const contents = document.querySelectorAll('.tab-content');
-            contents.forEach(c => c.classList.remove('active'));
-
-            // Deactivate all tab buttons
-            const buttons = document.querySelectorAll('.tab-button');
-            buttons.forEach(b => b.classList.remove('active'));
-
-            // Show selected tab and activate button
+        function openTab(evt, tabId, threadName, threadColor) {{
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            document.querySelectorAll('.thread-item').forEach(b => b.classList.remove('active'));
             document.getElementById(tabId).classList.add('active');
-            evt.currentTarget.classList.add('active');
+            if (evt && evt.currentTarget) {{
+                evt.currentTarget.classList.add('active');
+            }} else {{
+                document.querySelector('[data-tab="' + tabId + '"]').classList.add('active');
+            }}
+            const header = document.getElementById('content-header');
+            if (tabId === 'all-messages') {{
+                header.innerHTML = '<span>All Messages</span><small>Click a message to view its thread</small>';
+            }} else {{
+                header.innerHTML = '<span class="thread-dot" style="background:' + threadColor + '"></span>' + threadName;
+            }}
         }}
     </script>
 </body>
 </html>'''
 
 
+def load_channels_mapping() -> Dict[str, str]:
+    """Load channel ID to name mapping from channels.json."""
+    channels_file = BASE_DIR / "channels.json"
+    if channels_file.exists():
+        with open(channels_file, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {}
+
+
+def parse_slack_url(url: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Parse a Slack message URL to extract channel ID and timestamp.
+
+    URL format: https://workspace.slack.com/archives/CHANNEL_ID/pTIMESTAMP
+    Example: https://pmgnet.slack.com/archives/G2510ESB0/p1768001778553349
+
+    Returns: (channel_id, timestamp) or (None, None) if parsing fails
+    """
+    # Match pattern: /archives/CHANNEL_ID/pTIMESTAMP
+    match = re.search(r'/archives/([A-Z0-9]+)/p(\d+)', url)
+    if match:
+        channel_id = match.group(1)
+        raw_ts = match.group(2)
+        # Convert p1768001778553349 -> 1768001778.553349 (insert dot before last 6 digits)
+        if len(raw_ts) > 6:
+            timestamp = f"{raw_ts[:-6]}.{raw_ts[-6:]}"
+        else:
+            timestamp = raw_ts
+        return channel_id, timestamp
+    return None, None
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Detect conversational micro-threads in Slack messages"
     )
-    parser.add_argument("-c", "--channel", required=True,
-                        help="Channel name")
-    parser.add_argument("-t", "--ts", required=True,
-                        help="Target message timestamp")
+    parser.add_argument("-c", "--channel",
+                        help="Channel name (or use --slack-url)")
+    parser.add_argument("-t", "--ts",
+                        help="Target message timestamp (or use --slack-url)")
+    parser.add_argument("--slack-url",
+                        help="Slack message URL (e.g., https://workspace.slack.com/archives/G2510ESB0/p1768001778553349)")
     parser.add_argument("-w", "--window", type=int, default=DEFAULT_WINDOW,
                         help=f"Number of messages before/after target (default: {DEFAULT_WINDOW})")
     parser.add_argument("-m", "--model", default=DEFAULT_MODEL,
                         help=f"LLM model name (default: {DEFAULT_MODEL})")
-    parser.add_argument("--url", default=DEFAULT_LLM_URL,
+    parser.add_argument("--llm-url", default=DEFAULT_LLM_URL,
                         help=f"LLM server URL (default: {DEFAULT_LLM_URL})")
+    parser.add_argument("--max-tokens", type=int, default=4000,
+                        help="Max tokens for LLM response (default: 4000, increase for thinking models)")
     parser.add_argument("--json", action="store_true",
                         help="Output as JSON")
     parser.add_argument("--html", action="store_true",
@@ -760,16 +1112,44 @@ def main():
 
     args = parser.parse_args()
 
+    # Handle Slack URL parsing
+    channel = args.channel
+    ts = args.ts
+
+    if args.slack_url:
+        channel_id, parsed_ts = parse_slack_url(args.slack_url)
+        if not channel_id or not parsed_ts:
+            print(f"Error: Could not parse Slack URL: {args.slack_url}")
+            print("Expected format: https://workspace.slack.com/archives/CHANNEL_ID/pTIMESTAMP")
+            sys.exit(1)
+
+        # Look up channel name from ID
+        channels_map = load_channels_mapping()
+        if channel_id in channels_map:
+            channel = channels_map[channel_id]
+            print(f"Resolved channel ID '{channel_id}' to '{channel}'")
+        else:
+            print(f"Warning: Channel ID '{channel_id}' not found in channels.json, using ID as name")
+            channel = channel_id
+
+        ts = parsed_ts
+        print(f"Parsed timestamp: {ts}")
+
+    # Validate we have required arguments
+    if not channel or not ts:
+        print("Error: Must provide either --slack-url or both -c/--channel and -t/--ts")
+        sys.exit(1)
+
     # Fetch context window
-    print(f"Fetching messages from #{args.channel} around timestamp {args.ts}...")
-    messages, target_msg = fetch_context_window(args.channel, args.ts, args.window)
+    print(f"Fetching messages from #{channel} around timestamp {ts}...")
+    messages, target_msg = fetch_context_window(channel, ts, args.window)
 
     if not messages:
-        print(f"Error: No messages found in channel '{args.channel}'")
+        print(f"Error: No messages found in channel '{channel}'")
         sys.exit(1)
 
     if target_msg is None:
-        print(f"Warning: Target message with ts={args.ts} not found in results.")
+        print(f"Warning: Target message with ts={ts} not found in results.")
         print(f"Found {len(messages)} messages in the window.")
 
     print(f"Found {len(messages)} messages in context window.")
@@ -793,26 +1173,29 @@ def main():
         print("Using embeddings-only clustering...")
         threads = classify_with_embeddings_only(messages, ids, similarity)
     else:
-        print(f"Classifying with LLM ({args.model} at {args.url})...")
+        print(f"Classifying with LLM ({args.model} at {args.llm_url})...")
         threads = classify_with_llm(messages, features, similarity_hints,
-                                     args.url, args.model)
+                                     args.llm_url, args.model, args.max_tokens)
 
         # Fallback to embeddings if LLM fails
         if not threads:
             print("LLM classification returned no results, falling back to embeddings...")
             threads = classify_with_embeddings_only(messages, ids, similarity)
 
+    # Load user mappings for display name resolution
+    user_mappings = load_user_mappings()
+
     # Output results
     if args.html:
-        html_content = format_html_output(threads, messages, args.ts, args.channel, args.theme)
-        output_file = args.output or f"threads_{args.channel}.html"
+        html_content = format_html_output(threads, messages, ts, channel, args.theme, user_mappings)
+        output_file = args.output or f"threads_{channel}.html"
         with open(output_file, 'w', encoding='utf-8') as f:
             f.write(html_content)
         print(f"HTML output written to: {output_file}")
     elif args.json:
-        print(format_json_output(threads, messages, args.ts))
+        print(format_json_output(threads, messages, ts))
     else:
-        print(format_output(threads, messages, args.ts))
+        print(format_output(threads, messages, ts, user_mappings))
 
 
 if __name__ == "__main__":
